@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../vnpy_tdx"
+		}
+	],
+	"settings": {}
+}
