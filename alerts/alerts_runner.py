@@ -7,6 +7,7 @@ class AlertData(object):
     def __init__(self):
         self.name = ""
         self.code = ""
+        self.stock_name = ""
         self.descr = ""
 
 class AlertBase(object):

@@ -16,7 +16,7 @@ class TestAlertsRunner(unittest.TestCase):
     def test_run(self):
         alert = TurnoverAlert()
         alert.load_config(".vntrader/turnover_alert.json")
-        alert.configure_logging(enabled=True, level=logging.WARNING)
+        alert.configure_logging(enabled=True, level=logging.INFO)
 
         alert.pre_run()
 
