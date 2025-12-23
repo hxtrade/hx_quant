@@ -2,6 +2,7 @@ import os
 import importlib.util
 import inspect
 import json
+import time
 
 class AlertData(object):
     def __init__(self):
@@ -61,6 +62,11 @@ class AlertBase(object):
     
 class AlertsRunner(object):
     @staticmethod
+    def set_conf_path(conf_path):
+
+        AlertsRunner.conf_path = conf_path
+
+    @staticmethod
     def run_alerts(alerts_path):
         """扫描指定目录，查找alert.py文件并执行继承AlertBase的类"""
         if not os.path.exists(alerts_path):
@@ -92,6 +98,7 @@ class AlertsRunner(object):
                     continue
                 
                 # 查找继承自AlertBase的类
+                alerts = []
                 for name, obj in inspect.getmembers(module, inspect.isclass):
                     # 检查是否是当前模块定义的类，并且继承自AlertBase
                     if (obj.__module__ == module_name and 
@@ -103,11 +110,19 @@ class AlertsRunner(object):
                         try:
                             # 创建实例并执行run方法
                             alert_instance = obj()
-                            alert_instance.load_config(os.path.join(".vntrader", module_name +"_setting.json"))
+                            alert_instance.load_config(os.path.join(AlertsRunner.conf_path, module_name +"_setting.json"))
                             alert_instance.pre_run()
-                            alert_instance.run()
+                            alerts.append(alert_instance)
+                            # alert_instance.run()
                         except Exception as e:
                             print(f"执行 {name}.run() 失败: {e}")
+                while True:
+                    for alert in alerts:
+                        try:
+                            alert.run()
+                        except Exception as e:
+                            print(f"执行 {alert.name}.run() 失败: {e}")
+                    time.sleep(10)
 
     def __init__(self):
         pass

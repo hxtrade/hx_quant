@@ -14,16 +14,11 @@ class TurnoverAlert(AlertBase):
         super().__init__()
         self.name = "TurnoverAlert"
         self.monitor_stocks = []
+        self.hold_stocks = []
         self.datafeed = TdxDatafeed()
         self.stocks_cmv_map = {}
         self.stocks_basic_info = {}
         
-        # 渐进式检测状态
-        self.last_processed_index = {}  # 记录每只股票最后处理的数据索引
-        self.total_processed_count = {}  # 记录每只股票总共处理的数据条数
-        
-        # 连续买单检测状态
-        self.continuous_buy_state = {}  # 保存连续买单状态：{stock: {'count': int, 'amount': float, 'start_idx': int}}
         
         # 配置日志系统
         self.logger = logging.getLogger(f"{self.__class__.__name__}")
@@ -68,9 +63,9 @@ class TurnoverAlert(AlertBase):
             return
         
         monitor_blks = self.config["monitor_blks"]
-        self._log(logging.INFO, f"开始加载板块股票，板块列表: {monitor_blks}")
+        self._log(logging.INFO, f"开始加载买板块股票，板块列表: {monitor_blks}")
         
-        # 加载板块股票
+        # 加载买检测板块股票
         for blk in monitor_blks:
             try:
                 stocks = self.datafeed.get_block_stocks(blk)
@@ -82,16 +77,28 @@ class TurnoverAlert(AlertBase):
             except Exception as e:
                 self._log(logging.ERROR, f"获取板块 {blk} 股票失败: {e}")
                 continue
-        
+        try:
+            stocks = self.datafeed.get_block_stocks(self.config["monitor_hold_blk"])
+            if stocks:
+                self.hold_stocks.extend(stocks)
+                self._log(logging.INFO, f"从板块 {blk} 加载了 {len(stocks)} 只股票")
+            else:
+                self._log(logging.WARNING, f"板块 {blk} 没有找到股票")
+        except Exception as e:
+            self._log(logging.ERROR, f"获取板块 {blk} 股票失败: {e}")
         # 去重
         self.monitor_stocks = list(set(self.monitor_stocks))
-        self._log(logging.INFO, f"总共需要监控 {len(self.monitor_stocks)} 只股票")
+        self.hold_stocks = list(set(self.hold_stocks))
+        self._log(logging.INFO, f"买单总共需要监控 {len(self.monitor_stocks)} 只股票")
+        self._log(logging.INFO, f"持仓总共需要监控 {len(self.hold_stocks)} 只股票")
         
         # 计算流通市值
         self._log(logging.INFO, "开始计算流通市值...")
         success_count = 0
+
+        stocks = self.monitor_stocks + self.hold_stocks
         
-        for stock in self.monitor_stocks:
+        for stock in stocks:
             try:
                 # 获取股票价格信息
                 quote_data = self.datafeed.get_stock_basic_info(stock)
@@ -123,7 +130,7 @@ class TurnoverAlert(AlertBase):
                 self._log(logging.ERROR, f"计算 {stock} 流通市值时出错: {e}")
                 continue
         
-        self._log(logging.INFO, f"成功计算 {success_count}/{len(self.monitor_stocks)} 只股票的流通市值")
+        self._log(logging.INFO, f"成功计算 {success_count}/{len(self.monitor_stocks)+len(self.hold_stocks)} 只股票的流通市值")
         
         if len(self.stocks_cmv_map) == 0:
             self._log(logging.WARNING, "没有成功计算任何股票的流通市值，告警功能可能无法正常工作")
@@ -132,6 +139,7 @@ class TurnoverAlert(AlertBase):
             self._log(logging.INFO, f"流通市值计算完成，最大市值: {max(self.stocks_cmv_map.values())/100000000:,.0f} 亿元")
     def run(self):
         alerts = []
+        self._log(logging.INFO, f"开始检测连续单...")
         for stock in self.monitor_stocks:
             try:
                 req = HistoryRequest(
@@ -147,7 +155,7 @@ class TurnoverAlert(AlertBase):
                     continue
                 
                 # 检测连续买单
-                continuous_buy_info = self._detect_continuous_buy_orders(transaction, stock)
+                continuous_buy_info = self._detect_continuous_orders(transaction, stock, 0)
                 if continuous_buy_info:
                     # 创建告警
                     alert = AlertData()
@@ -163,16 +171,48 @@ class TurnoverAlert(AlertBase):
                 self._log(logging.ERROR, f"处理股票 {stock} 时出错: {e}")
                 continue
         
+        for stock in self.hold_stocks:
+            try:
+                req = HistoryRequest(
+                    symbol=stock,
+                    exchange=Exchange.SZSE if stock.startswith(('000', '002', '300')) else Exchange.SSE,
+                    interval=Interval.TICK,
+                    start=datetime.now(),
+                    end=datetime.now(),
+                )
+                transaction = self.datafeed.query_transaction_history(req)
+                
+                if transaction is None or transaction.empty:
+                    continue
+                
+                # 检测连续卖单
+                continuous_sell_info = self._detect_continuous_orders(transaction, stock, 1)
+                if continuous_sell_info:
+                    # 创建告警
+                    alert = AlertData()
+                    alert.name = self.name
+                    alert.code = stock
+                    alert.stock_name = self.stocks_basic_info[stock]['name']
+                    alert.descr = f"检测到连续卖单：{continuous_sell_info['description']}"
+                    alerts.append(alert)
+                    
+                    self._log(logging.WARNING, f"告警触发 - {stock}:{alert.stock_name}: {continuous_sell_info['description']}")
+                    
+            except Exception as e:
+                self._log(logging.ERROR, f"处理股票 {stock} 时出错: {e}")
+                continue
+
         return alerts
     
-    def _detect_continuous_buy_orders(self, transaction_df: pd.DataFrame, stock: str) -> dict:
+    def _detect_continuous_orders(self, transaction_df: pd.DataFrame, stock: str, buyorsell: int) -> dict:
         """
-        渐进式检测连续买单成交额大于流通市值1/500的情况
-        已检测过的数据会被忽略，同时绘制价格和成交额曲线
+        检测连续买单或卖单成交额大于流通市值1/500的情况
+        每次都重新扫描所有数据，只检测指定类型
         
         Args:
-            transaction_df: 新增的交易数据DataFrame
+            transaction_df: 交易数据DataFrame
             stock: 股票代码
+            buyorsell: 检测类型 (0=买单, 1=卖单)
             
         Returns:
             dict: 检测结果信息，如果没有触发条件返回None
@@ -183,96 +223,68 @@ class TurnoverAlert(AlertBase):
         circulating_market_value = self.stocks_cmv_map[stock]
         threshold = circulating_market_value / 5000 * 6  # 流通市值的1/500
         
-        # 获取上次处理的索引位置
-        last_index = self.last_processed_index.get(stock, -1)
-        total_count = self.total_processed_count.get(stock, 0)
+        # 临时变量记录本次扫描的最大连续序列
+        max_continuous_count = 0
+        max_continuous_amount = 0.0
+        max_continuous_start_idx = None
+        max_continuous_end_idx = None
         
-        # 筛选出新的交易数据（使用索引位置而不是时间）
-        if last_index >= 0:
-            # 从上次处理位置之后的数据开始
-            new_transactions = transaction_df.iloc[last_index + 1:]
-        else:
-            new_transactions = transaction_df
+        # 统计满足阈值的连续序列信息
+        qualified_count = 0
+        qualified_total_amount = 0.0  # 所有满足条件的连续序列的总成交额
         
-        if new_transactions.empty:
-            return None
-        
-        # 更新处理状态
-        new_total_count = total_count + len(new_transactions)
-        new_last_index = len(transaction_df) - 1
-        
-        # 初始化连续买单状态（如果不存在）
-        if stock not in self.continuous_buy_state:
-            self.continuous_buy_state[stock] = {
-                'count': 0,
-                'amount': 0.0,
-                'start_idx': None
-            }
-        
-        # 获取当前连续买单状态
-        current_state = self.continuous_buy_state[stock]
+        # 当前连续序列的临时状态
+        current_count = 0
+        current_amount = 0.0
+        current_start_idx = None
         
 
         
-        # 检测连续买单（基于保存的状态）
-        max_continuous_count = current_state['count']
-        max_continuous_amount = current_state['amount']
-        max_continuous_start_idx = current_state['start_idx']
-        
-        # 记录本次检测中的最大连续买单信息
-        max_this_batch_count = 0
-        max_this_batch_amount = 0.0
-        max_this_batch_start_idx = None
-        max_this_batch_end_idx = None
-        
-        for i, (_, row) in enumerate(new_transactions.iterrows()):
-            # 计算在整个数据流中的实际索引
-            actual_idx = total_count + i
-            
-            # 判断是否为买单：买入量大于卖出量
+        # 遍历所有交易数据
+        for i, (_, row) in enumerate(transaction_df.iterrows()):
             buy_or_sell = row.get('buyorsell', 0)
             turnover = row.get('volume', 0)
             
-            if buy_or_sell == 0:
-                # 这是买单
-                if current_state['count'] == 0:
-                    current_state['start_idx'] = actual_idx
+            # 只检测指定类型的连续序列
+            if buy_or_sell == buyorsell:
+                # 这是目标类型的订单
+                if current_count == 0:
+                    current_start_idx = i
                 
-                current_state['count'] += 1
-                current_state['amount'] += turnover
+                current_count += 1
+                current_amount += turnover
                 
-                # 更新本次检测中的最大值
-                if current_state['count'] > max_this_batch_count:
-                    max_this_batch_count = current_state['count']
-                    max_this_batch_amount = current_state['amount']
-                    max_this_batch_start_idx = current_state['start_idx']
-                    max_this_batch_end_idx = actual_idx
-                elif current_state['count'] == max_this_batch_count:
+                # 更新最大连续序列信息
+                if current_count > max_continuous_count:
+                    max_continuous_count = current_count
+                    max_continuous_amount = current_amount
+                    max_continuous_start_idx = current_start_idx
+                    max_continuous_end_idx = i
+                elif current_count == max_continuous_count:
                     # 如果次数相同，比较成交额
-                    if current_state['amount'] > max_this_batch_amount:
-                        max_this_batch_amount = current_state['amount']
-                        max_this_batch_start_idx = current_state['start_idx']
-                        max_this_batch_end_idx = actual_idx
+                    if current_amount > max_continuous_amount:
+                        max_continuous_amount = current_amount
+                        max_continuous_start_idx = current_start_idx
+                        max_continuous_end_idx = i
+                        
             else:
-                # 不是买单，重置计数
-                current_state['count'] = 0
-                current_state['amount'] = 0.0
-                current_state['start_idx'] = None
+                # 不是目标类型，重置当前计数
+                if current_amount > threshold:
+                    qualified_count += 1
+                    qualified_total_amount += current_amount  # 累加满足条件的序列成交额
+                
+                current_count = 0
+                current_amount = 0.0
+                current_start_idx = None
         
-        # 更新整体最大连续买单信息
-        if current_state['count'] > max_continuous_count:
-            max_continuous_count = current_state['count']
-            max_continuous_amount = current_state['amount']
-            max_continuous_start_idx = current_state['start_idx']
-        elif current_state['count'] == max_continuous_count:
-            # 如果次数相同，比较成交额
-            if current_state['amount'] > max_continuous_amount:
-                max_continuous_amount = current_state['amount']
-                max_continuous_start_idx = current_state['start_idx']
+        # 检查最后一个序列是否满足条件
+        if current_amount > threshold:
+            qualified_count += 1
+            qualified_total_amount += current_amount  # 累加满足条件的序列成交额
         
-        # 更新处理状态
-        self.last_processed_index[stock] = new_last_index
-        self.total_processed_count[stock] = new_total_count
+        # 设置结果变量
+        order_type = "买" if buyorsell == 0 else "卖"
+        qualified_sequences_count = qualified_count
         
         # 检查是否满足条件
         if max_continuous_amount > threshold:
@@ -283,18 +295,28 @@ class TurnoverAlert(AlertBase):
             if max_continuous_start_idx is not None:
                 start_time = transaction_df.iloc[max_continuous_start_idx].get('time', '')
             
-            # 结束时间使用当前最新数据的时间
-            if len(transaction_df) > 0:
-                end_time = transaction_df.iloc[-1].get('time', '')
+            if max_continuous_end_idx is not None:
+                end_time = transaction_df.iloc[max_continuous_end_idx].get('time', '')
             
-            # 计算占比
+            # 计算占总成交额的比值
+            total_turnover = transaction_df['volume'].sum()
+            # 使用所有满足条件的连续序列总成交额计算比值
+            qualified_total_ratio = (qualified_total_amount / total_turnover) * 100 if total_turnover > 0 else 0
+            # 最大连续序列占总成交额的比值（保留原有逻辑）
+            max_continuous_ratio = (max_continuous_amount / total_turnover) * 100 if total_turnover > 0 else 0
+            
+            # 计算占流通市值的比值
             percentage = (max_continuous_amount / circulating_market_value) * 100
             
             description = (
-                f"连续{max_continuous_count}笔买单，"
+                f"连续{max_continuous_count}笔{order_type}单，"
                 f"成交额{max_continuous_amount/10000:,.0f}万元，"
+                f"占总成交额{max_continuous_ratio:.2f}%，"
                 f"占流通市值{percentage:.3f}%，"
-                f"阈值{threshold/10000:,.0f}万元"
+                f"阈值{threshold/10000:,.0f}万元，"
+                f"共出现{qualified_count}次符合条件的连续{order_type}单，"
+                f"累计成交额{qualified_total_amount/10000:,.0f}万元，"
+                f"占总成交额{qualified_total_ratio:.2f}%"
             )
             
             if start_time and end_time:
@@ -305,6 +327,10 @@ class TurnoverAlert(AlertBase):
                 'continuous_amount': max_continuous_amount,
                 'threshold': threshold,
                 'percentage': percentage,
+                'total_turnover_ratio': max_continuous_ratio,
+                'qualified_count': qualified_count,
+                'qualified_total_amount': qualified_total_amount,
+                'qualified_total_ratio': qualified_total_ratio,
                 'start_time': start_time,
                 'end_time': end_time,
                 'description': description
