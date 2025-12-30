@@ -22,7 +22,7 @@ class TurnoverAlert(AlertBase):
         
         # 配置日志系统
         self.logger = logging.getLogger(f"{self.__class__.__name__}")
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(logging.WARNING)
         
         # 如果没有handler，添加一个控制台handler
         if not self.logger.handlers:
@@ -33,7 +33,7 @@ class TurnoverAlert(AlertBase):
         
         # 日志开关（可以通过配置控制）
         self.log_enabled = True
-        self.log_level = logging.INFO
+        self.log_level = logging.WARNING
     
     def _log(self, level: int, message: str):
         """带开关的日志函数"""
@@ -81,11 +81,11 @@ class TurnoverAlert(AlertBase):
             stocks = self.datafeed.get_block_stocks(self.config["monitor_hold_blk"])
             if stocks:
                 self.hold_stocks.extend(stocks)
-                self._log(logging.INFO, f"从板块 {blk} 加载了 {len(stocks)} 只股票")
+                self._log(logging.INFO, f"从板块 {self.config['monitor_hold_blk']} 加载了 {len(stocks)} 只股票")
             else:
-                self._log(logging.WARNING, f"板块 {blk} 没有找到股票")
+                self._log(logging.WARNING, f"板块 {self.config['monitor_hold_blk']} 没有找到股票")
         except Exception as e:
-            self._log(logging.ERROR, f"获取板块 {blk} 股票失败: {e}")
+            self._log(logging.ERROR, f"获取板块 {self.config['monitor_hold_blk']} 股票失败: {e}")
         # 去重
         self.monitor_stocks = list(set(self.monitor_stocks))
         self.hold_stocks = list(set(self.hold_stocks))
@@ -102,7 +102,7 @@ class TurnoverAlert(AlertBase):
             try:
                 # 获取股票价格信息
                 quote_data = self.datafeed.get_stock_basic_info(stock)
-                if len(quote_data) == 0:
+                if quote_data is None or len(quote_data) == 0:
                     self._log(logging.WARNING, f"获取 {stock} 价格信息失败")
                     continue
                 self.stocks_basic_info[stock] = quote_data
@@ -137,7 +137,7 @@ class TurnoverAlert(AlertBase):
         else:
             self._log(logging.INFO, f"流通市值计算完成，最小市值: {min(self.stocks_cmv_map.values())/100000000:,.0f} 亿元")
             self._log(logging.INFO, f"流通市值计算完成，最大市值: {max(self.stocks_cmv_map.values())/100000000:,.0f} 亿元")
-    def run(self):
+    def run(self) -> list[AlertData]:
         alerts = []
         self._log(logging.INFO, f"开始检测连续单...")
         for stock in self.monitor_stocks:
@@ -161,7 +161,7 @@ class TurnoverAlert(AlertBase):
                     alert = AlertData()
                     alert.name = self.name
                     alert.code = stock
-                    alert.stock_name = self.stocks_basic_info[stock]['name']
+                    alert.stock_name = self.stocks_basic_info.get(stock, {}).get('name', stock)
                     alert.descr = f"检测到连续买单：{continuous_buy_info['description']}"
                     alerts.append(alert)
                     

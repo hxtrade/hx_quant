@@ -61,13 +61,16 @@ class AlertBase(object):
         return []
     
 class AlertsRunner(object):
+    
+    _alerts = []
+
     @staticmethod
     def set_conf_path(conf_path):
 
         AlertsRunner.conf_path = conf_path
 
     @staticmethod
-    def run_alerts(alerts_path):
+    def find_alerts(alerts_path):
         """扫描指定目录，查找alert.py文件并执行继承AlertBase的类"""
         if not os.path.exists(alerts_path):
             print(f"目录不存在: {alerts_path}")
@@ -98,7 +101,6 @@ class AlertsRunner(object):
                     continue
                 
                 # 查找继承自AlertBase的类
-                alerts = []
                 for name, obj in inspect.getmembers(module, inspect.isclass):
                     # 检查是否是当前模块定义的类，并且继承自AlertBase
                     if (obj.__module__ == module_name and 
@@ -112,20 +114,25 @@ class AlertsRunner(object):
                             alert_instance = obj()
                             alert_instance.load_config(os.path.join(AlertsRunner.conf_path, module_name +"_setting.json"))
                             alert_instance.pre_run()
-                            alerts.append(alert_instance)
+                            AlertsRunner._alerts.append(alert_instance)
                             # alert_instance.run()
                         except Exception as e:
                             print(f"执行 {name}.run() 失败: {e}")
-                while True:
-                    for alert in alerts:
-                        try:
-                            alert.run()
-                        except Exception as e:
-                            print(f"执行 {alert.name}.run() 失败: {e}")
-                    time.sleep(10)
+
+    @staticmethod
+    def run_alerts():
+        """执行所有告警"""
+        alerts = []
+        for alert in AlertsRunner._alerts:
+            try:
+                alert_list = alert.run()
+                alerts.append(alert_list)
+                # 打印每个告警
+                for a in alert_list:
+                    print(f"{a.name} {a.code} {a.stock_name} {a.descr}")
+            except Exception as e:
+                print(f"执行 {alert.__class__.__name__}.run() 失败: {e}")
+        return alerts
 
     def __init__(self):
         pass
-
-if __name__ == "__main__":
-    AlertsRunner.run_alerts("./alerts")

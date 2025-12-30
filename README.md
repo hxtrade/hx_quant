@@ -257,14 +257,11 @@ pytest
 
 ## 📚 文档
 
-- [完整文档](https://hx-quant.readthedocs.io/)
-- [API参考](https://hx-quant.readthedocs.io/en/latest/api/)
-- [示例教程](https://hx-quant.readthedocs.io/en/latest/examples/)
-- [贡献指南](https://hx-quant.readthedocs.io/en/latest/contributing/)
+- [文档](https://hxquant.github.io/hx-quant/)
 
 ## 🆘 支持
 
-- 📧 邮箱: team@hxquant.com
+- 📧 邮箱: GuoXing.Cheng@hxcul.cn
 - 🐛 问题反馈: [GitHub Issues](https://github.com/hxquant/hx-quant/issues)
 - 💬 讨论: [GitHub Discussions](https://github.com/hxquant/hx-quant/discussions)
 

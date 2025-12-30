@@ -23,7 +23,10 @@ dependencies = [
     "vnpy",
     "mootdx",
     "cn_stock_holidays",
-    "vnpy_tdx"
+    "vnpy_tdx",
+    "PySide6>=6.0.0",
+    "pandas",
+    "numpy"
 ]
 
 
