@@ -6,18 +6,38 @@ import sys
 import os
 from datetime import datetime
 from typing import List, Dict, Any
-from collections import defaultdict
+from collections import defaultdict, deque
 import re
+import threading
+import queue
+import copy
 
 import pandas as pd
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QLabel, QSplitter,
     QTextEdit, QGroupBox, QPushButton, QHeaderView,
-    QProgressBar, QStatusBar, QMessageBox, QFileDialog
+    QProgressBar, QStatusBar, QMessageBox, QFileDialog,
+    QDialog
 )
 from PySide6.QtCore import QTimer, Qt, QThread, Signal, QObject
 from PySide6.QtGui import QFont, QColor
+
+    # 尝试导入matplotlib
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+    import matplotlib
+    MATPLOTLIB_AVAILABLE = True
+    # 配置中文字体
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+    matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+except ImportError as e:
+    print(f"警告: 无法导入matplotlib - {e}")
+    MATPLOTLIB_AVAILABLE = False
 
 # 尝试导入告警模块
 try:
@@ -111,6 +131,458 @@ class AlertWorker(QObject):
                 
         except Exception as e:
             self.error_occurred.emit(f"检测出错: {e}")
+
+
+class DataBuffer:
+    """数据缓冲区 - 双缓冲模式"""
+    def __init__(self, max_size=10000):
+        self.lock = threading.Lock()
+        self.write_buffer = None  # 使用DataFrame存储最新数据
+        self.read_buffer = None
+        self.data_version = 0  # 数据版本号
+        self.max_size = max_size
+
+    def push_data(self, data):
+        """写入数据到写缓冲区 - 直接替换全部数据"""
+        with self.lock:
+            self.write_buffer = data
+            self.data_version += 1
+            return self.data_version
+
+    def swap_buffers(self):
+        """交换读写缓冲区，返回新的数据版本号"""
+        with self.lock:
+            # 交换缓冲区：写缓冲区变成读缓冲区
+            self.read_buffer = self.write_buffer
+            return self.data_version
+
+    def get_read_data(self):
+        """获取读缓冲区数据"""
+        with self.lock:
+            if self.read_buffer is None:
+                return []
+            return [self.read_buffer]
+
+    def clear(self):
+        """清空缓冲区"""
+        with self.lock:
+            self.write_buffer = None
+            self.read_buffer = None
+
+
+class DataProducer(QThread):
+    """数据生产者线程 - 从TdxDatafeed读取数据"""
+    data_updated = Signal()  # 数据更新信号
+
+    def __init__(self, stock_code, exchange):
+        super().__init__()
+        self.stock_code = stock_code
+        self.exchange = exchange
+        self.running = False
+        self.data_buffer = None
+        self.update_interval = 2  # 每2秒更新一次
+
+    def set_data_buffer(self, buffer):
+        """设置数据缓冲区"""
+        self.data_buffer = buffer
+
+    def run(self):
+        """运行生产者线程"""
+        self.running = True
+        while self.running:
+            try:
+                from alerts.alerts_runner import AlertsRunner
+                from vnpy.trader.object import HistoryRequest
+                from vnpy.trader.constant import Interval, Exchange
+
+                # 获取数据源
+                if hasattr(AlertsRunner, 'datafeed'):
+                    datafeed = AlertsRunner.datafeed
+                else:
+                    from alerts.turnover_alert import TurnoverAlert
+                    temp_alert = TurnoverAlert()
+                    datafeed = temp_alert.datafeed
+
+                # 转换交易所类型
+                if self.exchange == 'SZSE':
+                    exchange_type = Exchange.SZSE
+                elif self.exchange == 'SSE':
+                    exchange_type = Exchange.SSE
+                else:
+                    exchange_type = Exchange.SSE
+
+                # 查询交易数据 - 每次都查询从9:30到现在的全部数据，然后去重
+                from datetime import timedelta
+
+                now = datetime.now()
+
+                # 获取今天的开盘时间（9:30）和当前时间
+                today_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+
+                # 如果当前时间小于9:30，则查询昨天的数据
+                if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+                    today_start -= timedelta(days=1)
+
+                req = HistoryRequest(
+                    symbol=self.stock_code,
+                    exchange=exchange_type,
+                    interval=Interval.TICK,
+                    start=today_start,
+                    end=now,
+                )
+
+                transaction = datafeed.query_transaction_history(req)
+
+                if transaction is not None and not transaction.empty:
+                    # 直接替换全部数据，不做增量处理
+                    version = self.data_buffer.push_data(transaction)
+                    print(f"生产者: 推送数据, 版本={version}, 行数={len(transaction)}")
+
+                # 发送数据更新信号
+                self.data_updated.emit()
+
+            except Exception as e:
+                import traceback
+                print(f"生产者线程错误: {e}")
+                traceback.print_exc()
+
+            # 等待下一次更新
+            self.msleep(self.update_interval * 1000)
+
+    def stop(self):
+        """停止生产者线程"""
+        self.running = False
+        self.wait()
+
+
+class StockChartDialog(QDialog):
+    """股票成交曲线图对话框"""
+
+    def __init__(self, stock_code, stock_name, parent=None):
+        super().__init__(parent)
+        self.stock_code = stock_code
+        self.stock_name = stock_name
+        self.transaction_data = []
+        self.is_closed = False
+        self._is_updating = False  # 标记是否正在更新，避免并发更新
+        self.last_data_version = 0  # 上次更新的数据版本号
+
+        # 创建双缓冲区
+        self.data_buffer = DataBuffer(max_size=20000)
+
+        # 创建生产者线程
+        exchange_type = 'SZSE' if stock_code.startswith(('000', '002', '300')) else 'SSE'
+        self.producer = DataProducer(stock_code, exchange_type)
+        self.producer.set_data_buffer(self.data_buffer)
+        self.producer.data_updated.connect(self.on_data_updated)
+
+        self.init_ui()
+        self.load_data()
+        
+    def init_ui(self):
+        """初始化界面"""
+        self.setWindowTitle(f"{self.stock_code} - {self.stock_name} 成交曲线")
+        self.setMinimumSize(800, 600)
+        self.resize(1000, 700)
+        
+        # 创建主布局
+        layout = QVBoxLayout(self)
+        
+        # 标题
+        title_label = QLabel(f"📊 {self.stock_code} {self.stock_name} 实时成交曲线")
+        title_label.setFont(QFont("微软雅黑", 12, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # 图表区域
+        chart_layout = QVBoxLayout()
+        
+        if MATPLOTLIB_AVAILABLE:
+            # 创建matplotlib图表 - 价格和成交额两个子图
+            self.figure = Figure(figsize=(10, 8), dpi=100)
+            self.canvas = FigureCanvas(self.figure)
+            
+            # 创建两个子图：上方价格，下方成交额
+            self.ax_price = self.figure.add_subplot(211)
+            self.ax_volume = self.figure.add_subplot(212)
+            self.figure.subplots_adjust(hspace=0.3)
+            
+            # 添加导航工具栏
+            self.toolbar = NavigationToolbar(self.canvas, self)
+            layout.addWidget(self.toolbar)
+            layout.addWidget(self.canvas)
+            
+            # 设置图表样式
+            self.setup_chart()
+        else:
+            # matplotlib不可用，显示提示
+            warning_label = QLabel("⚠️ matplotlib未安装，无法显示图表")
+            warning_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(warning_label)
+        
+        layout.addLayout(chart_layout)
+        
+        # 信息标签
+        self.info_label = QLabel("等待数据...")
+        self.info_label.setStyleSheet("QLabel { background-color: #f0f0f0; padding: 10px; }")
+        layout.addWidget(self.info_label)
+        
+        # 关闭按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        self.close_btn = QPushButton("关闭")
+        self.close_btn.clicked.connect(self.close)
+        button_layout.addWidget(self.close_btn)
+        
+        layout.addLayout(button_layout)
+        
+        # 启动生产者线程
+        self.producer.start()
+
+        # 定时器只用于定期清理和健康检查
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.health_check)
+        self.update_timer.start(5000)  # 每5秒检查一次
+        
+    def setup_chart(self):
+        """设置图表"""
+        # 价格曲线
+        self.ax_price.clear()
+        self.ax_price.set_title(f"{self.stock_code} - {self.stock_name} 价格走势", fontsize=12)
+        self.ax_price.set_ylabel("价格(元)", fontsize=10)
+        self.ax_price.grid(True, alpha=0.3)
+        
+        # 成交额曲线
+        self.ax_volume.clear()
+        self.ax_volume.set_title(f"{self.stock_code} - {self.stock_name} 成交额", fontsize=12)
+        self.ax_volume.set_xlabel("时间", fontsize=10)
+        self.ax_volume.set_ylabel("成交额(万元)", fontsize=10)
+        self.ax_volume.grid(True, alpha=0.3)
+        self.figure.tight_layout()
+        
+    def load_data(self):
+        """加载初始数据"""
+        # 生产者线程会自动加载初始数据，这里不需要额外加载
+        pass
+
+    def health_check(self):
+        """健康检查 - 定期清理和状态检查"""
+        if not self.is_closed:
+            write_rows = len(self.data_buffer.write_buffer) if self.data_buffer.write_buffer is not None else 0
+            read_rows = len(self.data_buffer.read_buffer) if self.data_buffer.read_buffer is not None else 0
+            print(f"健康检查: 写缓冲区={write_rows}行, "
+                  f"读缓冲区={read_rows}行, "
+                  f"数据版本={self.data_buffer.data_version}")
+    
+    def update_chart_async(self):
+        """异步更新图表 - 使用QTimer.singleShot避免阻塞"""
+        # 这个方法已废弃，现在使用on_data_updated从缓冲区读取
+        pass
+
+    def _update_chart_data(self, times, prices, amounts, colors):
+        """更新图表数据（不重置整个图表）"""
+        try:
+            # 清除旧数据
+            self.ax_price.clear()
+            self.ax_volume.clear()
+
+            # 重新设置标题和标签
+            self.ax_price.set_title(f"{self.stock_code} - {self.stock_name} 价格走势", fontsize=12)
+            self.ax_price.set_ylabel("价格(元)", fontsize=10)
+            self.ax_price.grid(True, alpha=0.3)
+
+            self.ax_volume.set_title(f"{self.stock_code} - {self.stock_name} 成交额", fontsize=12)
+            self.ax_volume.set_xlabel("时间", fontsize=10)
+            self.ax_volume.set_ylabel("成交额(万元)", fontsize=10)
+            self.ax_volume.grid(True, alpha=0.3)
+
+            # 绘制数据（使用更高效的plot方式）
+            x_data = range(len(times))
+
+            # 价格曲线
+            self.ax_price.plot(x_data, prices,
+                              linewidth=1, color='#FF6B35', alpha=0.8, label='price')
+
+            # 成交额柱状图，根据买卖方向显示不同颜色
+            for i, (x, amount, color) in enumerate(zip(x_data, amounts, colors)):
+                # 未知类型使用不透明度1.0，其他类型使用0.7
+                alpha = 1.0 if color == '#4A4A4A' else 0.7
+                self.ax_volume.bar(x, amount, color=color, alpha=alpha, width=0.6)
+
+            # 添加图例说明
+            from matplotlib.patches import Patch
+            legend_elements = [
+                Patch(facecolor='#FF0000', label='买单'),
+                Patch(facecolor='#00FF00', label='卖单'),
+                Patch(facecolor='#4A4A4A', label='未知')
+            ]
+            self.ax_volume.legend(handles=legend_elements, prop={'size': 8})
+
+            # 设置x轴标签（只设置一次）- 横坐标使用序号
+            n_labels = min(len(times), 10)
+            step = max(1, len(times) // n_labels) if len(times) > 0 else 1
+            tick_positions = list(range(0, len(times), step))
+            tick_labels = [times[pos] for pos in tick_positions]
+
+            self.ax_price.set_xticks(tick_positions)
+            self.ax_price.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=8)
+            self.ax_price.legend(prop={'size': 8})
+
+            self.ax_volume.set_xticks(tick_positions)
+            self.ax_volume.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=8)
+
+            self.figure.tight_layout()
+        except Exception as e:
+            print(f"更新图表数据失败: {e}")
+
+    def _update_info_label(self, amounts, prices):
+        """更新信息标签"""
+        total_amount = sum(amounts) if amounts else 0
+        max_amount = max(amounts) if amounts else 0
+        min_price = min(prices) if prices else 0
+        max_price = max(prices) if prices else 0
+        avg_amount = total_amount / len(amounts) if amounts else 0
+        
+        # 统计颜色分布
+        from collections import Counter
+        color_counts = Counter(self.transaction_data['buyorsell'].values if hasattr(self.transaction_data, 'buyorsell') else [])
+        buy_count = color_counts.get(0, 0)
+        sell_count = color_counts.get(1, 0)
+        unknown_count = color_counts.get(2, 0)
+        
+        info_text = (
+            f"📊 统计信息 | "
+            f"成交笔数: {len(amounts)} | "
+            f"价格范围: {min_price:.2f}-{max_price:.2f}元 | "
+            f"总成交额: {total_amount:.2f}万元 | "
+            f"最大单笔: {max_amount:.2f}万元 | "
+            f"平均成交: {avg_amount:.2f}万元 | "
+            f"🔴买单: {buy_count} 🟢卖单: {sell_count} ⚫未知: {unknown_count}"
+        )
+        self.info_label.setText(info_text)
+    
+    def on_data_updated(self):
+        """数据更新事件 - 从缓冲区读取数据并更新图表"""
+        if self.is_closed or self._is_updating:
+            return
+
+        # 交换缓冲区
+        current_version = self.data_buffer.swap_buffers()
+
+        # 如果数据没有更新，则跳过
+        if current_version == self.last_data_version:
+            return
+
+        self.last_data_version = current_version
+        print(f"消费者: 读取数据, 版本={current_version}")
+
+        # 异步更新图表
+        self._is_updating = True
+        QTimer.singleShot(10, lambda: self._update_from_buffer())
+
+    def _update_from_buffer(self):
+        """从缓冲区更新图表"""
+        try:
+            # 从读缓冲区获取数据
+            transactions = self.data_buffer.get_read_data()
+
+            if not transactions:
+                return
+
+            # 直接使用最新的DataFrame，不需要合并
+            all_data = transactions[0]  # 直接获取DataFrame
+
+            self.transaction_data = all_data
+            print(f"消费者: 更新图表, 数据行数={len(all_data)}")
+
+            # 提取并绘制数据
+            self._extract_and_draw(all_data)
+
+        except Exception as e:
+            print(f"从缓冲区更新失败: {e}")
+        finally:
+            # 延迟解锁
+            QTimer.singleShot(50, lambda: setattr(self, '_is_updating', False))
+
+    def _extract_and_draw(self, transaction):
+        """提取数据并绘制"""
+        try:
+            # 高效提取数据
+            times = []
+            prices = []
+            amounts = []
+            colors = []  # 柱状图颜色
+
+            # 获取列数据，增加容错
+            time_values = []
+            price_values = []
+            volume_values = []
+            direction_values = []
+
+            # 尝试不同的列名
+            time_values = transaction['time'].values if 'time' in transaction.columns else []
+            price_values = transaction['price'].values if 'price' in transaction.columns else []
+            volume_values = transaction['volume'].values if 'volume' in transaction.columns else []
+            direction_values = transaction['buyorsell'].values if 'buyorsell' in transaction.columns else []
+
+            # 统计颜色分布（只在第一次更新时打印）
+            if len(direction_values) > 0 and len(self.transaction_data) == 0:
+                from collections import Counter
+                color_stats = Counter(direction_values)
+                print(f"颜色统计: 买单(0)={color_stats.get(0, 0)}, 卖单(1)={color_stats.get(1, 0)}, 未知(2)={color_stats.get(2, 0)}")
+
+            # 按顺序遍历数据,使新数据显示在右侧
+            for i in range(len(transaction)):
+                # 横坐标使用序号
+                seq_num = i + 1
+                times.append(str(seq_num))
+
+                try:
+                    price_val = float(price_values[i]) if i < len(price_values) else 0
+                    prices.append(price_val)
+                except (ValueError, TypeError) as e:
+                    prices.append(0)
+
+                try:
+                    amount_val = float(volume_values[i]) / 10000 if i < len(volume_values) else 0
+                    amounts.append(amount_val)
+                except (ValueError, TypeError):
+                    amounts.append(0)
+
+                # 获取买卖方向（注意：列名是 buyorsell，0=买，1=卖，2=未知/中性）
+                direction = direction_values[i] if i < len(direction_values) else -1
+
+                # 确定颜色：买单红色，卖单绿色，未知深灰色
+                if direction == 0:  # 买单
+                    colors.append('#FF0000')  # 红色
+                elif direction == 1:  # 卖单
+                    colors.append('#00FF00')  # 绿色
+                else:  # direction == 2 或其他
+                    colors.append('#4A4A4A')  # 深灰色（更明显）
+
+            # 只在有新数据时才重绘
+            if times and prices and amounts:
+                # 更新图表（不调用setup_chart，只更新数据）
+                self._update_chart_data(times, prices, amounts, colors)
+
+            # 使用更高效的绘制方式
+            self.canvas.draw_idle()
+
+            # 延迟更新信息标签
+            QTimer.singleShot(50, lambda: self._update_info_label(amounts, prices))
+
+        except Exception as e:
+            print(f"提取和绘制数据失败: {e}")
+
+    def closeEvent(self, event):
+        """关闭事件"""
+        self.is_closed = True
+        if hasattr(self, 'update_timer'):
+            self.update_timer.stop()
+        if hasattr(self, 'producer'):
+            self.producer.stop()
+        event.accept()
 
 
 class AlertMonitorWindow(QMainWindow):
@@ -238,6 +710,7 @@ class AlertMonitorWindow(QMainWindow):
         
         # 连接选择事件
         self.alert_table.itemSelectionChanged.connect(self.on_alert_selected)
+        self.alert_table.cellDoubleClicked.connect(self.on_alert_double_clicked)
         
         layout.addWidget(self.alert_table)
         
@@ -471,6 +944,21 @@ class AlertMonitorWindow(QMainWindow):
         match = re.search(pattern, text)
         return match.group(1) if match else None
         
+    def on_alert_double_clicked(self, row, column):
+        """告警双击事件 - 打开成交曲线图"""
+        if row >= 0:
+            # 获取选中的告警数据
+            code_item = self.alert_table.item(row, 1)
+            name_item = self.alert_table.item(row, 2)
+            
+            if code_item and name_item:
+                # 移除买卖标识获取股票代码
+                code = code_item.text().replace('🟢 ', '').replace('🔴 ', '')
+                name = name_item.text()
+                
+                # 打开成交曲线图对话框
+                self.open_stock_chart(code, name)
+    
     def on_alert_selected(self):
         """告警选择事件"""
         current_row = self.alert_table.currentRow()
@@ -490,6 +978,18 @@ class AlertMonitorWindow(QMainWindow):
                 
                 if alert_data:
                     self.show_alert_detail(alert_data)
+    
+    def open_stock_chart(self, stock_code, stock_name):
+        """打开股票成交曲线图"""
+        if not MATPLOTLIB_AVAILABLE:
+            QMessageBox.warning(self, '警告', 'matplotlib未安装，无法显示图表\n请安装: pip install matplotlib')
+            return
+        
+        try:
+            dialog = StockChartDialog(stock_code, stock_name, self)
+            dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'打开图表失败:\n{str(e)}')
             
     def show_alert_detail(self, alert_data):
         """显示告警详情"""
@@ -553,8 +1053,8 @@ class AlertMonitorWindow(QMainWindow):
             current = datetime.now()
             alert_time = datetime.strptime(time_str, "%H:%M:%S")
             alert_datetime = current.replace(
-                hour=alert_time.hour, 
-                minute=alert_time.minute, 
+                hour=alert_time.hour,
+                minute=alert_time.minute,
                 second=alert_time.second
             )
             return (current - alert_datetime).total_seconds() < 300
